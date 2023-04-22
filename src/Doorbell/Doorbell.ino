@@ -30,8 +30,8 @@ int activationMinute = -1;
 int activationHour = -1;
 
 unsigned long ringStartTime;
-unsigned long timerTime1000 = 0;
-unsigned long timerTime3600000 = 0;
+unsigned long timerMinute = 0;
+unsigned long timerHour = 0;
 
 void setup() {
   Serial.begin(115200);
@@ -129,8 +129,8 @@ void loop() {
   }
 
   // Tasks executed every second
-  if (millis() - timerTime1000 >= 1000) {
-    timerTime1000 += 1000;
+  if (millis() - timerMinute >= 1000) {
+    timerMinute += 1000;
 
     // Activate bell at midnight if deactivated
     time(&timeNow);                      // read the current time
@@ -189,8 +189,8 @@ void loop() {
   }
 
   // Tasks executed every hour
-  if (millis() - timerTime3600000 >= 3600000) {
-    timerTime3600000 += 3600000;
+  if (millis() - timerHour >= 3600000) {
+    timerHour += 3600000;
 
     // Heartbeat signal
     MqttClient.publish("Doorbell/Heartbeat", "1");
