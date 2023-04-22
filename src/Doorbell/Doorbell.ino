@@ -4,26 +4,34 @@
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <PubSubClient.h>
-#include <NTPClient.h>
+#include <time.h>
 
 WiFiClient espClient;
 PubSubClient MqttClient(espClient);
-const long utcOffsetInSeconds = 3600;
-WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "pool.ntp.org", utcOffsetInSeconds);
+
+/* Configuration of NTP */
+#define MY_NTP_SERVER "pool.ntp.org"
+#define MY_TZ "CET-1CEST,M3.5.0/02,M10.5.0/03"
+
+time_t timeNow;
+tm timeStruct;
 
 bool bellActive = true;
 bool bellRing = false;
+bool bellRingOnce = false;
 
-bool bellButtonPrevious;
 bool bellButtonCurrent;
+bool bellButtonMqtt = false;
 
+int bellRingLoops = 0;
+int bellRingLoopsExecute = 2;  //Execute ringing after two program loops with high signal
 int deactivationDuration;
 int activationMinute = -1;
 int activationHour = -1;
 
 unsigned long ringStartTime;
-unsigned long timerTime = 0;
+unsigned long timerTime1000 = 0;
+unsigned long timerTime3600000 = 0;
 
 void setup() {
   Serial.begin(115200);
@@ -67,7 +75,7 @@ void setup() {
   Serial.println("Ready");
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
-  timeClient.begin();
+  configTime(MY_TZ, MY_NTP_SERVER);
 }
 
 void loop() {
@@ -76,28 +84,42 @@ void loop() {
   connectMqtt();
   MqttClient.loop();
 
-  // Evaluate bell button
+  // Evaluate bell button - save number of loops where button is pressed to variable
   bellButtonCurrent = digitalRead(BELLBUTTON);
-  if (!bellButtonCurrent and bellButtonPrevious) {
+  if (bellButtonCurrent) {
+    bellRingLoops = 0;
+  } else if (!bellButtonCurrent) {
+    bellRingLoops += 1;
+  }
+
+  // Send value of BellButton via MQTT (Send '0' if not pressed)
+  if ((bellRingLoops == 0) && bellButtonMqtt) {
+    MqttClient.publish("Doorbell/BellButton", "0");
+    bellButtonMqtt = false;
+  }
+
+  // Only execute if specific number of loops finished
+  if (bellRingLoops == bellRingLoopsExecute) {
     MqttClient.publish("Doorbell/BellButton", "1");
+    bellButtonMqtt = true;
     // Set bell to ring
     Serial.println("Set bell to ring from button");
     bellRing = true;
+    bellRingOnce = true;
     ringStartTime = millis();
-  } else if (bellButtonCurrent and !bellButtonPrevious) {
-    MqttClient.publish("Doorbell/BellButton", "0");
   }
-  // Save status for edge detection
-  bellButtonPrevious = bellButtonCurrent;
 
   // Evaluate bell ringing
   if (bellActive & bellRing) {
     Serial.println("bellActive & bellRing");
     // Activate bell ring for the predefined time
     if (millis() - ringStartTime <= ringTime) {
-      Serial.println("Bell rings - relay triggered");
-      digitalWrite(RELAY, LOW);
-      MqttClient.publish("Doorbell/BellRing", "1");
+      if (bellRingOnce) {
+        Serial.println("Bell rings - relay triggered");
+        digitalWrite(RELAY, LOW);
+        MqttClient.publish("Doorbell/BellRing", "1");
+        bellRingOnce = false;
+      }
     } else {
       Serial.println("Bell ring stop - relay triggered");
       digitalWrite(RELAY, HIGH);
@@ -107,12 +129,14 @@ void loop() {
   }
 
   // Tasks executed every second
-  if (millis() - timerTime >= 1000) {
-    timerTime += 1000;
+  if (millis() - timerTime1000 >= 1000) {
+    timerTime1000 += 1000;
 
     // Activate bell at midnight if deactivated
-    timeClient.update();
-    if (timeClient.getHours() == 0 && timeClient.getMinutes() == 0 && timeClient.getSeconds() == 1) {
+    time(&timeNow);                      // read the current time
+    localtime_r(&timeNow, &timeStruct);  // update the structure tm with the current time
+
+    if (timeStruct.tm_hour == 0 && timeStruct.tm_min == 0 && timeStruct.tm_sec == 1) {
       if (bellActive == 0) {
         bellActive = 1;
         MqttClient.publish("Doorbell/BellActive", "1");
@@ -123,11 +147,13 @@ void loop() {
 
     // Check automatic activation
     if (activationHour >= 0 && activationMinute >= 0) {
-      if (timeClient.getHours() == activationHour && timeClient.getMinutes() == activationMinute) {
+      if (timeStruct.tm_hour == activationHour && timeStruct.tm_min == activationMinute) {
         bellActive = 1;
         MqttClient.publish("Doorbell/BellActive", "1");
         String mqttMessage = F("Bell activated at ");
-        mqttMessage.concat(timeClient.getFormattedTime());
+        char buffer[8];
+        sprintf(buffer, "%02d:%02d:%02d", timeStruct.tm_hour, timeStruct.tm_min, timeStruct.tm_sec);
+        mqttMessage.concat(buffer);
         MqttClient.publish("Doorbell/Status", mqttMessage.c_str());
         Serial.println(mqttMessage);
 
@@ -138,31 +164,36 @@ void loop() {
 
     // Set activation time
     if (deactivationDuration > 0) {
-      activationMinute = timeClient.getMinutes() + deactivationDuration;
+      activationMinute = timeStruct.tm_min + deactivationDuration;
       int additionalHours = 0;
       if (activationMinute >= 60) {
         additionalHours = activationMinute / 60;
         activationMinute = activationMinute % 60;
       }
 
-      activationHour = timeClient.getHours() + additionalHours;
+      activationHour = timeStruct.tm_hour + additionalHours;
       if (activationHour >= 24) {
         activationHour = activationHour % 24;
       }
 
       String mqttMessage = F("Bell will be activated at ");
-      if (activationHour < 10)
-        mqttMessage.concat(F("0"));
-      mqttMessage.concat(activationHour);
-      mqttMessage.concat(F(":"));
-      if (activationMinute < 10)
-        mqttMessage.concat(F("0"));
-      mqttMessage.concat(activationMinute);
+      char buffer[8];
+      sprintf(buffer, "%02d:%02d:%02d", activationHour, activationMinute, timeStruct.tm_sec);
+      mqttMessage.concat(buffer);
+
       MqttClient.publish("Doorbell/Status", mqttMessage.c_str());
       Serial.println(mqttMessage);
 
       deactivationDuration = 0;
     }
+  }
+
+  // Tasks executed every hour
+  if (millis() - timerTime3600000 >= 3600000) {
+    timerTime3600000 += 3600000;
+
+    // Heartbeat signal
+    MqttClient.publish("Doorbell/Heartbeat", "1");
   }
 }
 
@@ -265,6 +296,7 @@ void subscribeReceive(char* topic, byte* payload, unsigned int length) {
     else if (strncmp((char*)payload, "Once", length) == 0) {
       if (bellActive) {
         bellRing = true;
+        bellRingOnce = true;
         ringStartTime = millis();
         MqttClient.publish("Doorbell/Status", "Ring triggered");
         Serial.println("External ringing triggered");
